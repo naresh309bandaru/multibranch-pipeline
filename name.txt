@@ -1,0 +1,554 @@
+pipeline {
+
+    agent {
+        label 'macos-release'
+    }
+
+    parameters {
+
+        string(
+            name: 'RELEASE_ID',
+            defaultValue: '',
+            description: 'Unique release ID'
+        )
+
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'live'],
+            description: 'Release environment'
+        )
+
+        choice(
+            name: 'PLATFORMS',
+            choices: ['android', 'ios', 'android,ios'],
+            description: 'Select Android, iOS or both'
+        )
+
+        string(
+            name: 'S3_BUCKET',
+            defaultValue: 'digit-superapp-nonprod',
+            description: 'Lower environment S3 bucket'
+        )
+
+        string(
+            name: 'TICKET_NUMBER',
+            defaultValue: '',
+            description: 'Release/Jira ticket number'
+        )
+
+        string(
+            name: 'ANDROID_VERSION_NAME',
+            defaultValue: '',
+            description: 'Android version name'
+        )
+
+        string(
+            name: 'ANDROID_VERSION_CODE',
+            defaultValue: '',
+            description: 'Android version code'
+        )
+
+        string(
+            name: 'IOS_MARKETING_VERSION',
+            defaultValue: '',
+            description: 'iOS marketing version'
+        )
+
+        string(
+            name: 'IOS_BUILD_NUMBER',
+            defaultValue: '',
+            description: 'iOS build number'
+        )
+
+        string(
+            name: 'MODULES',
+            defaultValue: 'all',
+            description: 'Modules to include'
+        )
+
+        choice(
+            name: 'VERSION_STRATEGY',
+            choices: ['next-minor', 'next-rc'],
+            description: 'Release version strategy'
+        )
+
+        string(
+            name: 'BUNDLE_CONCURRENCY',
+            defaultValue: '4',
+            description: 'Remote bundle build concurrency'
+        )
+
+        string(
+            name: 'S3_BASE_PREFIX',
+            defaultValue: '',
+            description: 'Optional S3 base prefix'
+        )
+
+        string(
+            name: 'SOURCE_BRANCH',
+            defaultValue: 'develop',
+            description: 'Git branch to build'
+        )
+
+        booleanParam(
+            name: 'BUILD_QA',
+            defaultValue: true,
+            description: 'Generate QA APK/IPA'
+        )
+
+        booleanParam(
+            name: 'BUILD_FINAL',
+            defaultValue: true,
+            description: 'Generate final APK/AAB/IPA'
+        )
+
+        booleanParam(
+            name: 'UPLOAD_TO_S3',
+            defaultValue: true,
+            description: 'Upload remote bundles to S3'
+        )
+    }
+
+    environment {
+        RELEASE_PLAN = ".release/${RELEASE_ID}/release-plan.json"
+        S3_UPLOAD_DIR = ".release/${RELEASE_ID}/s3-upload"
+    }
+
+    stages {
+
+        stage('Environment Check') {
+            steps {
+                sh '''
+                    #!/bin/zsh
+
+                    set -e
+
+                    echo "======================================"
+                    echo " Jenkins Mac Environment"
+                    echo "======================================"
+
+                    echo "Hostname:"
+                    hostname
+
+                    echo "OS:"
+                    sw_vers
+
+                    echo "User:"
+                    whoami
+
+                    echo "Workspace:"
+                    pwd
+
+                    echo "Git:"
+                    git --version
+
+                    echo "Node:"
+                    node --version
+
+                    echo "Yarn:"
+                    yarn --version
+
+                    echo "Java:"
+                    java -version
+
+                    echo "Xcode:"
+                    xcodebuild -version
+
+                    echo "CocoaPods:"
+                    pod --version
+
+                    echo "Android:"
+                    adb --version
+
+                    echo "AWS:"
+                    aws --version
+
+                    echo "======================================"
+                    echo "Environment check completed"
+                    echo "======================================"
+                '''
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${SOURCE_BRANCH}"]],
+                    userRemoteConfigs: [[
+                        credentialsId: 'customer-app-git',
+                        url: '<YOUR_GIT_REPOSITORY_URL>'
+                    ]]
+                ])
+
+                sh '''
+                    #!/bin/zsh
+                    set -e
+
+                    echo "Current branch:"
+                    git branch --show-current
+
+                    echo "Latest commit:"
+                    git log -1 --oneline
+
+                    echo "Repository files:"
+                    ls -la
+                '''
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh '''
+                    #!/bin/zsh
+
+                    set -e
+
+                    echo "Enabling Corepack..."
+                    corepack enable
+
+                    echo "Installing root dependencies..."
+                    yarn install --immutable
+
+                    if [ -d "packages/host" ]; then
+                        echo "Installing host dependencies..."
+
+                        cd packages/host
+
+                        yarn install --immutable
+
+                        if [ -f "Gemfile" ]; then
+                            bundle install
+                        fi
+
+                        cd ../..
+                    fi
+
+                    echo "Dependencies installed successfully."
+                '''
+            }
+        }
+
+        stage('Android Environment Validation') {
+            when {
+                expression {
+                    params.PLATFORMS == 'android' ||
+                    params.PLATFORMS == 'android,ios'
+                }
+            }
+
+            steps {
+                sh '''
+                    #!/bin/zsh
+
+                    set -e
+
+                    echo "Android SDK:"
+                    echo "$ANDROID_HOME"
+
+                    echo "ADB:"
+                    adb --version
+
+                    echo "Java:"
+                    java -version
+
+                    echo "Checking Android project..."
+
+                    test -d android
+
+                    echo "Android environment is ready."
+                '''
+            }
+        }
+
+        stage('iOS Environment Validation') {
+            when {
+                expression {
+                    params.PLATFORMS == 'ios' ||
+                    params.PLATFORMS == 'android,ios'
+                }
+            }
+
+            steps {
+                sh '''
+                    #!/bin/zsh
+
+                    set -e
+
+                    echo "Xcode:"
+                    xcodebuild -version
+
+                    echo "CocoaPods:"
+                    pod --version
+
+                    test -d ios
+
+                    echo "Checking code signing identities..."
+
+                    security find-identity -v -p codesigning || true
+
+                    echo "iOS environment is ready."
+                '''
+            }
+        }
+
+        stage('Create Release Plan') {
+            steps {
+                sh '''
+                    #!/bin/zsh
+
+                    set -e
+
+                    echo "Creating release plan..."
+
+                    yarn release:plan \
+                        --release-id "$RELEASE_ID" \
+                        --environment "$ENVIRONMENT" \
+                        --platforms "$PLATFORMS" \
+                        --android-version-name "$ANDROID_VERSION_NAME" \
+                        --android-version-code "$ANDROID_VERSION_CODE" \
+                        --ios-marketing-version "$IOS_MARKETING_VERSION" \
+                        --ios-build-number "$IOS_BUILD_NUMBER" \
+                        --modules "$MODULES" \
+                        --strategy "$VERSION_STRATEGY" \
+                        --s3-bucket "$S3_BUCKET"
+
+                    echo "Release plan:"
+                    cat "$RELEASE_PLAN"
+                '''
+            }
+        }
+
+        stage('Apply Release Versions') {
+            steps {
+                sh '''
+                    #!/bin/zsh
+
+                    set -e
+
+                    yarn release:versions \
+                        --plan "$RELEASE_PLAN"
+                '''
+            }
+        }
+
+        stage('Validate S3 Versions') {
+            steps {
+                sh '''
+                    #!/bin/zsh
+
+                    set -e
+
+                    yarn release:versions:validate-s3 \
+                        --plan "$RELEASE_PLAN"
+                '''
+            }
+        }
+
+        stage('Build Remote GS Bundles') {
+            steps {
+                sh '''
+                    #!/bin/zsh
+
+                    set -e
+
+                    echo "Building remote/GS bundles..."
+
+                    yarn release:bundles \
+                        --plan "$RELEASE_PLAN" \
+                        --concurrency "$BUNDLE_CONCURRENCY"
+
+                    echo "Generated S3 upload files:"
+
+                    if [ ! -d "$S3_UPLOAD_DIR" ]; then
+                        echo "ERROR: S3 upload directory not found:"
+                        echo "$S3_UPLOAD_DIR"
+                        exit 1
+                    fi
+
+                    find "$S3_UPLOAD_DIR" -type f -print
+                '''
+            }
+        }
+
+        stage('Build QA Artifacts') {
+            when {
+                expression {
+                    params.BUILD_QA
+                }
+            }
+
+            steps {
+                sh '''
+                    #!/bin/zsh
+
+                    set -e
+
+                    echo "Building QA APK/IPA..."
+
+                    yarn release:qa \
+                        --plan "$RELEASE_PLAN"
+
+                    echo "QA artifacts:"
+                    find ".release/$RELEASE_ID" -type f \
+                        \\( -name "*.apk" -o -name "*.ipa" \\) \
+                        -print
+                '''
+            }
+        }
+
+        stage('Upload Remote Bundles to Lower S3') {
+            when {
+                expression {
+                    params.UPLOAD_TO_S3
+                }
+            }
+
+            steps {
+
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding',
+                     credentialsId: 'aws-s3-customer-app-nonprod']
+                ]) {
+
+                    sh '''
+                        #!/bin/zsh
+
+                        set -e
+
+                        echo "======================================"
+                        echo " Uploading Remote Bundles"
+                        echo "======================================"
+
+                        test -d "$S3_UPLOAD_DIR"
+
+                        echo "AWS Account:"
+                        aws sts get-caller-identity
+
+                        echo "Bucket:"
+                        echo "$S3_BUCKET"
+
+                        echo "Upload directory:"
+                        echo "$S3_UPLOAD_DIR"
+
+                        aws s3 cp \
+                            "$S3_UPLOAD_DIR/" \
+                            "s3://$S3_BUCKET/" \
+                            --recursive
+
+                        echo "S3 upload completed."
+
+                        echo "Uploaded objects:"
+                        aws s3 ls \
+                            "s3://$S3_BUCKET/" \
+                            --recursive
+                    '''
+                }
+            }
+        }
+
+        stage('Build Final Native Artifacts') {
+            when {
+                expression {
+                    params.BUILD_FINAL
+                }
+            }
+
+            steps {
+                sh '''
+                    #!/bin/zsh
+
+                    set -e
+
+                    echo "Building final native artifacts..."
+
+                    yarn release:native \
+                        --plan "$RELEASE_PLAN"
+
+                    echo "Final artifacts generated."
+                '''
+            }
+        }
+
+        stage('Validate Release Artifacts') {
+            steps {
+                sh '''
+                    #!/bin/zsh
+
+                    set -e
+
+                    echo "======================================"
+                    echo " Release Artifacts"
+                    echo "======================================"
+
+                    find ".release/$RELEASE_ID" -type f \
+                        \\( \
+                        -name "*.apk" \
+                        -o -name "*.aab" \
+                        -o -name "*.ipa" \
+                        \\) \
+                        -print
+
+                    echo ""
+                    echo "======================================"
+                    echo " S3 Bundle Files"
+                    echo "======================================"
+
+                    find "$S3_UPLOAD_DIR" -type f -print
+
+                    echo ""
+                    echo "Release validation completed."
+                '''
+            }
+        }
+
+        stage('Archive Artifacts') {
+            steps {
+                archiveArtifacts(
+                    artifacts: ".release/${RELEASE_ID}/**/*.apk,.release/${RELEASE_ID}/**/*.aab,.release/${RELEASE_ID}/**/*.ipa",
+                    allowEmptyArchive: false,
+                    fingerprint: true
+                )
+            }
+        }
+    }
+
+    post {
+
+        success {
+            echo """
+            ======================================
+            RELEASE SUCCESSFUL
+            ======================================
+            Release ID : ${RELEASE_ID}
+            Environment: ${ENVIRONMENT}
+            Platforms  : ${PLATFORMS}
+            S3 Bucket  : ${S3_BUCKET}
+
+            Remote bundles uploaded:
+            ${S3_UPLOAD_DIR}
+
+            Jenkins artifacts archived successfully.
+            ======================================
+            """
+        }
+
+        failure {
+            echo """
+            ======================================
+            RELEASE FAILED
+            ======================================
+            Release ID : ${RELEASE_ID}
+            Environment: ${ENVIRONMENT}
+            Platforms  : ${PLATFORMS}
+
+            Check the failed stage and console logs.
+            ======================================
+            """
+        }
+
+        always {
+            echo "Pipeline execution completed."
+        }
+    }
+}
